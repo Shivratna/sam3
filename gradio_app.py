@@ -1,8 +1,12 @@
 import glob
 import os
 import subprocess
+import sys
 import uuid
 from typing import Dict, List, Optional, Tuple
+import contextlib
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import gradio as gr
@@ -14,15 +18,27 @@ from pathlib import Path
 
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_video_predictor
 from sam3.visualization_utils import COLORS, prepare_masks_for_visualization, render_masklet_frame
+
+
+def _bf16_autocast_if_cuda():
+    """Use bf16 autocast on CUDA when available; no-op otherwise."""
+    if torch.cuda.is_available():
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 # Lazily instantiated globals (created via the "Load models" button)
 IMAGE_MODEL = None
 IMAGE_PROCESSOR: Optional[Sam3Processor] = None
 VIDEO_PREDICTOR = None
 TEMP_IMAGE_PATH = Path(__file__).resolve().parent / "temp.jpg"
+GRADIO_TEMP = Path(__file__).resolve().parent / "temp_videos" / "gradio_temp"
+TEMP_VIDEO_ROOT = Path(__file__).resolve().parent / "temp_video"
 
+# Keep Gradio uploads out of the default OS temp (e.g., AppData) by redirecting its temp dir.
+os.environ.setdefault("GRADIO_TEMP_DIR", str(GRADIO_TEMP))
+GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+TEMP_VIDEO_ROOT.mkdir(parents=True, exist_ok=True)
 
 # ------------------------------
 # Utility helpers
@@ -201,6 +217,9 @@ def load_models(progress=gr.Progress(track_tqdm=True)):
     global IMAGE_MODEL, IMAGE_PROCESSOR, VIDEO_PREDICTOR
     logs = []
 
+    # To avoid bf16 conv bias mismatches in this app, default to full precision for the tracker unless the user overrides.
+    os.environ.setdefault("SAM3_DISABLE_BF16", "1")
+
     if IMAGE_MODEL is None:
         progress(0.1, desc="Loading image model")
         IMAGE_MODEL = build_sam3_image_model(enable_inst_interactivity=True)
@@ -209,13 +228,6 @@ def load_models(progress=gr.Progress(track_tqdm=True)):
         logs.append(f"Image model ready on {device}.")
     else:
         logs.append("Image model already loaded.")
-
-    if VIDEO_PREDICTOR is None:
-        progress(0.6, desc="Loading video predictor")
-        VIDEO_PREDICTOR = build_sam3_video_predictor()
-        logs.append("Video predictor ready.")
-    else:
-        logs.append("Video predictor already loaded.")
 
     progress(1.0, desc="Done")
     return "\n".join(logs)
@@ -363,30 +375,8 @@ def apply_points_table(table_data, text_prompt, multimask, image_session, curren
 
 
 # ------------------------------
-# Video tab callbacks
+# Video tab callbacks (chunked subprocess pipeline)
 # ------------------------------
-def _get_video_inference_state(session_id: str):
-    """Access the underlying predictor session to inspect cached outputs."""
-    if VIDEO_PREDICTOR is None:
-        return None
-    try:
-        session_entry = VIDEO_PREDICTOR._ALL_INFERENCE_STATES.get(session_id)
-    except Exception:
-        return None
-    if session_entry is None:
-        return None
-    return session_entry.get("state")
-
-
-def _frame_has_cached_output(session_id: str, frame_idx: int) -> bool:
-    """Check whether the predictor has cached masks for a frame (after propagation)."""
-    state = _get_video_inference_state(session_id)
-    if state is None:
-        return False
-    cached = state.get("cached_frame_outputs", {})
-    return frame_idx in cached and cached[frame_idx] is not None
-
-
 def _parse_video_dir(video_path: str) -> List[str]:
     frame_paths = glob.glob(os.path.join(video_path, "*.jpg"))
     try:
@@ -413,278 +403,157 @@ def _extract_video_to_frames(video_path: str, dest_root: Path) -> List[str]:
     return _parse_video_dir(str(dest_root))
 
 
-def start_video_session(video_file: str, prev_state: Optional[Dict]):
-    if VIDEO_PREDICTOR is None:
-        return None, None, None, None, None, "Load models before uploading a video."
+def _copy_video_to_temp(video_file: str) -> Path:
+    """Copy the uploaded video into the app temp_video folder (replacing if exists)."""
+    src = Path(video_file)
+    dest = TEMP_VIDEO_ROOT / src.name
+    if dest.exists():
+        if dest.is_file():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
+    shutil.copy2(src, dest)
+    return dest
+
+
+def _read_video_metadata(video_path: Path):
+    cap = cv2.VideoCapture(str(video_path))
+    fps_val = cap.get(cv2.CAP_PROP_FPS)
+    frame_count_val = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    success, first_frame = cap.read()
+    cap.release()
+    if not success or first_frame is None:
+        raise RuntimeError("Unable to read video.")
+    fps = float(fps_val) if fps_val and fps_val > 0 else 10.0
+    frame_count = int(frame_count_val) if frame_count_val and frame_count_val > 0 else 1
+    sample_frame = Image.fromarray(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
+    return fps, frame_count, sample_frame
+
+
+def prepare_video_upload_chunked(video_file: str, prev_state: Optional[Dict]):
+    """Copy upload to temp_video, return preview + state."""
     if video_file is None:
-        return None, None, None, None, None, "Please upload a video file or folder."
+        return None, None, None, "Please upload a video file."
+    try:
+        dest = _copy_video_to_temp(video_file)
+        fps, frame_count, sample_frame = _read_video_metadata(dest)
+    except Exception as exc:
+        return None, None, None, f"Failed to load video: {exc}"
 
-    # Close any previous session
-    if prev_state and prev_state.get("session_id"):
-        try:
-            VIDEO_PREDICTOR.handle_request({"type": "close_session", "session_id": prev_state["session_id"]})
-        except Exception:
-            pass
-
-    video_path = video_file
-    frame_paths = None
-    sample_frame = None
-    fps = None
-    if os.path.isdir(video_path):
-        frame_paths = _parse_video_dir(video_path)
-        if frame_paths:
-            frame_count = len(frame_paths)
-            sample_frame = Image.open(frame_paths[0])
-        else:
-            return None, None, None, None, None, "Frame directory is empty."
-    else:
-        # Capture the native FPS before extracting frames
-        cap_check = cv2.VideoCapture(video_path)
-        fps_val = cap_check.get(cv2.CAP_PROP_FPS)
-        cap_check.release()
-        if fps_val and fps_val > 0:
-            fps = float(fps_val)
-        else:
-            fps = 10.0
-        # Extract frames to a temp folder
-        dest_root = Path("temp_videos") / str(uuid.uuid4())
-        try:
-            frame_paths = _extract_video_to_frames(video_path, dest_root)
-        except subprocess.CalledProcessError as e:
-            return None, None, None, None, None, f"Frame extraction failed: {e}"
-        if not frame_paths:
-            return None, None, None, None, None, "No frames extracted from video."
-        frame_count = len(frame_paths)
-        sample_frame = Image.open(frame_paths[0])
-        video_path = str(dest_root)
-
-    response = VIDEO_PREDICTOR.handle_request({"type": "start_session", "resource_path": video_path})
-    session_id = response["session_id"]
-    session_state = {
-        "session_id": session_id,
-        "video_path": video_path,
+    state = {
+        "video_path": str(dest),
         "frame_count": frame_count,
-        "frame_paths": frame_paths,
         "width": sample_frame.width,
         "height": sample_frame.height,
         "fps": fps,
     }
-
-    slider_update = gr.update(maximum=max(frame_count - 1, 0), value=0, interactive=True)
-    return (
-        sample_frame,
-        slider_update,
-        session_state,
-        [],
-        sample_frame,
-        f"Video loaded with {frame_count} frame(s). Session: {session_id}",
-    )
+    return sample_frame, state, f"Video copied to temp_video and ready. Frames: {frame_count}, FPS: {fps:.2f}"
 
 
-def refresh_video_frame(frame_idx: int, video_state: Optional[Dict], points_state: List[Dict]):
-    if video_state is None:
-        return None, gr.update(), "Load a video first."
-    frame_img = _load_video_frame(video_state, frame_idx)
-    points_on_frame = [p for p in points_state if p["frame"] == frame_idx]
-    annotated = _overlay_points(frame_img, points_on_frame)
-    return annotated, gr.update(), f"Showing frame {frame_idx}."
+def _chunk_frames(frames_dir: Path, chunk_size: int, chunks_root: Path) -> List[Path]:
+    frames = _parse_video_dir(str(frames_dir))
+    if not frames:
+        raise RuntimeError("No frames extracted from video.")
+    chunks_root.mkdir(parents=True, exist_ok=True)
+    chunk_dirs: List[Path] = []
+    for start in range(0, len(frames), chunk_size):
+        chunk_idx = len(chunk_dirs)
+        chunk_dir = chunks_root / f"chunk_{chunk_idx:04d}"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for frame_path in frames[start : start + chunk_size]:
+            src = Path(frame_path)
+            dest = chunk_dir / src.name
+            shutil.move(str(src), dest)
+        chunk_dirs.append(chunk_dir)
+    return chunk_dirs
 
 
-def handle_video_click(
-    frame_image: Image.Image,
-    point_label: str,
-    point_obj_id: float,
-    frame_idx: int,
-    points_state: List[Dict],
-    video_state: Optional[Dict],
-    evt: gr.SelectData,
-):
-    if video_state is None:
-        return frame_image, points_state, "Load a video first."
-    if evt is None or evt.index is None:
-        return frame_image, points_state, "Click data missing."
-    x, y = evt.index
-    label = 1 if point_label == "Positive" else 0
-    obj_id = int(point_obj_id) if point_obj_id is not None else 0
-    new_points = list(points_state) + [{"frame": frame_idx, "x": x, "y": y, "label": label, "obj_id": obj_id}]
-    points_on_frame = [p for p in new_points if p["frame"] == frame_idx]
-    overlay = _overlay_points(frame_image, points_on_frame)
-    return overlay, new_points, f"Added {point_label.lower()} point (obj {obj_id}) on frame {frame_idx} at ({int(x)}, {int(y)})."
+def _run_chunk_subprocess(chunk_dir: Path, out_dir: Path, prompt_text: str, checkpoint: str) -> Tuple[Path, int]:
+    worker_path = Path(__file__).resolve().parent / "video_chunk_worker.py"
+    cmd = [
+        sys.executable,
+        str(worker_path),
+        "--frames-dir",
+        str(chunk_dir),
+        "--output-dir",
+        str(out_dir),
+        "--prompt-text",
+        prompt_text or "",
+        "--checkpoint",
+        checkpoint,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return out_dir, result.returncode
 
 
-def clear_video_points(frame_idx: int, video_state: Optional[Dict]):
-    if video_state is None:
-        return None, [], gr.update(), "Nothing to clear."
-    frame_img = _load_video_frame(video_state, frame_idx)
-    return frame_img, [], gr.update(), "Cleared clicks."
+def _stitch_outputs(output_root: Path, fps: float, dest_path: Path):
+    frame_files = list(output_root.rglob("*.jpg"))
+    if not frame_files:
+        raise RuntimeError("No rendered frames to stitch.")
+    try:
+        frame_files.sort(key=lambda p: int(p.stem))
+    except ValueError:
+        frame_files.sort()
+    sample = cv2.imread(str(frame_files[0]))
+    height, width, _ = sample.shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(dest_path), fourcc, fps, (width, height))
+    for fp in frame_files:
+        img = cv2.imread(str(fp))
+        writer.write(img)
+    writer.release()
+    return dest_path
 
 
-def run_video_inference(
-    frame_idx: int,
+def run_chunked_video_processing(
     text_prompt: str,
-    run_propagation: bool,
-    max_frames: int,
-    preview_stride: int,
-    chunk_propagation: bool,
+    chunk_size: int,
+    parallel_chunks: int,
+    fps_override: float,
     video_state: Optional[Dict],
-    points_state: List[Dict],
 ):
-    if VIDEO_PREDICTOR is None:
-        raise gr.Error("Load models before running video inference.")
-    if video_state is None:
+    if video_state is None or not video_state.get("video_path"):
         raise gr.Error("Upload a video first.")
-    session_id = video_state["session_id"]
+    if chunk_size <= 0:
+        raise gr.Error("Chunk size must be > 0.")
+    video_path = Path(video_state["video_path"])
+    job_dir = TEMP_VIDEO_ROOT / f"job_{uuid.uuid4().hex}"
+    frames_dir = job_dir / "frames"
+    chunks_root = job_dir / "chunks"
+    outputs_root = job_dir / "outputs"
+    outputs_root.mkdir(parents=True, exist_ok=True)
 
-    cleaned_text = (text_prompt or "").strip()
-    log_lines = []
+    logs = []
+    logs.append(f"Job dir: {job_dir}")
+    logs.append("Extracting frames...")
+    frame_paths = _extract_video_to_frames(str(video_path), frames_dir)
+    logs.append(f"Extracted {len(frame_paths)} frame(s).")
 
-    points_for_frame = [p for p in points_state if p["frame"] == frame_idx]
-    pt_coords = None
-    pt_labels = None
-    obj_id = None
-    if points_for_frame:
-        pt_coords = torch.tensor(
-            [[p["x"] / video_state["width"], p["y"] / video_state["height"]] for p in points_for_frame],
-            dtype=torch.float32,
-        )
-        pt_labels = torch.tensor([p["label"] for p in points_for_frame], dtype=torch.int32)
-        obj_id = int(points_for_frame[0].get("obj_id", 0))
+    logs.append(f"Chunking into size {chunk_size}...")
+    chunk_dirs = _chunk_frames(frames_dir, chunk_size, chunks_root)
+    logs.append(f"Created {len(chunk_dirs)} chunk(s).")
 
-    if not cleaned_text and pt_coords is None:
-        raise gr.Error("Add a text prompt or click on the frame before running video inference.")
-    if points_for_frame and not _frame_has_cached_output(session_id, frame_idx):
-        raise gr.Error(
-            "No cached outputs for this frame. Use 'Apply prompt + propagate' once, then add clicks and re-run."
-        )
+    prompt_text = (text_prompt or "").strip()
+    checkpoint = "models/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
+    max_workers = max(1, min(parallel_chunks, len(chunk_dirs)))
+    logs.append(f"Running up to {max_workers} chunk worker(s) in parallel...")
 
-    request = {
-        "type": "add_prompt",
-        "session_id": session_id,
-        "frame_index": frame_idx,
-    }
-    if cleaned_text:
-        request["text"] = cleaned_text
-    if pt_coords is not None:
-        request["points"] = pt_coords
-        request["point_labels"] = pt_labels
-        request["obj_id"] = obj_id
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for chunk_dir in chunk_dirs:
+            out_dir = outputs_root / chunk_dir.name
+            futures.append(ex.submit(_run_chunk_subprocess, chunk_dir, out_dir, prompt_text, checkpoint))
+        for f in as_completed(futures):
+            out_dir, returncode = f.result()
+            if returncode != 0:
+                raise gr.Error(f"Chunk {out_dir.name} failed (return code {returncode}). Check logs.")
 
-    response = VIDEO_PREDICTOR.handle_request(request)
-    out = response["outputs"]
-    log_lines.append(f"Prompt applied on frame {frame_idx}.")
-    frame_img = np.array(_load_video_frame(video_state, frame_idx))
-    overlay = render_masklet_frame(frame_img, out, frame_idx=frame_idx, alpha=0.6)
-
-    gallery = []
-    log_lines.append(f"Objects: {len(out['out_obj_ids'])}.")
-    propagation_video = None
-
-    if run_propagation:
-        collected = {}
-        if chunk_propagation and (max_frames is not None) and max_frames > 0:
-            total_frames = video_state.get("frame_count", max_frames)
-            start_f = max(0, min(frame_idx, total_frames - 1))
-            chunk_size = max_frames
-            while start_f < total_frames:
-                state = _get_video_inference_state(session_id)
-                if state is not None and "action_history" in state:
-                    state["action_history"].clear()
-                for resp in VIDEO_PREDICTOR.handle_stream_request(
-                    {
-                        "type": "propagate_in_video",
-                        "session_id": session_id,
-                        "start_frame_index": start_f,
-                        "max_frame_num_to_track": chunk_size,
-                    }
-                ):
-                    collected[resp["frame_index"]] = resp["outputs"]
-                start_f += chunk_size
-            log_lines.append(f"Chunked propagation completed over {len(collected)} frames (chunk size {chunk_size}).")
-        else:
-            for resp in VIDEO_PREDICTOR.handle_stream_request(
-                {
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "start_frame_index": frame_idx,
-                    "max_frame_num_to_track": max_frames if max_frames > 0 else None,
-                }
-            ):
-                collected[resp["frame_index"]] = resp["outputs"]
-        stride = max(1, preview_stride)
-        selected_frames = sorted(collected.keys())[::stride]
-        frames_for_video = []
-        for fidx in selected_frames:
-            frame_np = np.array(_load_video_frame(video_state, fidx))
-            vis = render_masklet_frame(frame_np, collected[fidx], frame_idx=fidx, alpha=0.6)
-            gallery.append((vis, f"Frame {fidx}"))
-            frames_for_video.append((fidx, vis))
-        log_lines.append(f"Propagation preview generated for {len(selected_frames)} frame(s) (stride={stride}).")
-        # Save a simple playback of the propagated frames
-        if frames_for_video:
-            try:
-                temp_dir = Path("temp_videos")
-                temp_dir.mkdir(parents=True, exist_ok=True)
-                video_path = temp_dir / f"prop_{session_id}.mp4"
-                height, width, _ = frames_for_video[0][1].shape
-                import cv2
-
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                fps = video_state.get("fps", 10.0)
-                if fps is None or fps <= 0:
-                    fps = 10.0
-                writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-                for _, img_rgb in frames_for_video:
-                    writer.write(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
-                writer.release()
-                propagation_video = str(video_path)
-                log_lines.append(f"Saved propagation playback to {video_path}.")
-            except Exception as e:
-                log_lines.append(f"Could not save propagation video: {e}")
-
-    return overlay, gallery, "\n".join(log_lines), video_state, points_state, propagation_video
-
-
-def run_video_prompt_only(
-    frame_idx: int,
-    text_prompt: str,
-    max_frames: int,
-    preview_stride: int,
-    chunk_propagation: bool,
-    video_state: Optional[Dict],
-    points_state: List[Dict],
-):
-    overlay, gallery, log, state, points, _ = run_video_inference(
-        frame_idx=frame_idx,
-        text_prompt=text_prompt,
-        run_propagation=False,
-        max_frames=max_frames,
-        preview_stride=preview_stride,
-        chunk_propagation=chunk_propagation,
-        video_state=video_state,
-        points_state=points_state,
-    )
-    return overlay, gallery, log, state, points, None
-
-
-def run_video_prompt_and_propagate(
-    frame_idx: int,
-    text_prompt: str,
-    max_frames: int,
-    preview_stride: int,
-    chunk_propagation: bool,
-    video_state: Optional[Dict],
-    points_state: List[Dict],
-):
-    return run_video_inference(
-        frame_idx=frame_idx,
-        text_prompt=text_prompt,
-        run_propagation=True,
-        max_frames=max_frames,
-        preview_stride=preview_stride,
-        chunk_propagation=chunk_propagation,
-        video_state=video_state,
-        points_state=points_state,
-    )
+    fps = fps_override if fps_override and fps_override > 0 else video_state.get("fps", 10.0)
+    final_path = job_dir / "masked_video.mp4"
+    logs.append(f"Stitching outputs at {fps:.2f} FPS...")
+    stitched = _stitch_outputs(outputs_root, fps=fps, dest_path=final_path)
+    logs.append(f"Done. Final video at {stitched}.")
+    return str(stitched), "\n".join(logs)
 
 
 # ------------------------------
@@ -692,11 +561,10 @@ def run_video_prompt_and_propagate(
 # ------------------------------
 with gr.Blocks(title="SAM3 Gradio Demo") as demo:
     status_box = gr.Textbox(label="Logs", lines=6, interactive=False)
-    load_btn = gr.Button("Load models", variant="primary")
-    load_btn.click(load_models, outputs=status_box)
-
     with gr.Tabs():
         with gr.Tab("Image"):
+            load_btn = gr.Button("Load models", variant="primary")
+            load_btn.click(load_models, outputs=status_box)
             with gr.Row():
                 with gr.Column(scale=1):
                     text_prompt = gr.Textbox(label="Text prompt", placeholder="e.g., cat, person, flower")
@@ -768,101 +636,37 @@ with gr.Blocks(title="SAM3 Gradio Demo") as demo:
         with gr.Tab("Video"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    video_input = gr.Video(label="Upload MP4 or folder path (mounted) for frames")
-                    frame_slider = gr.Slider(label="Frame index", minimum=0, maximum=0, value=0, step=1)
-                    point_label_video = gr.Radio(
-                        choices=["Positive", "Negative"], value="Positive", label="Click type"
+                    video_input = gr.Video(label="Upload MP4 (saved to temp_video)")
+                    text_prompt_video = gr.Textbox(label="Text prompt", placeholder="e.g., person", value="")
+                    chunk_size_slider = gr.Slider(
+                        value=500, minimum=1, maximum=1000, step=1, label="Chunk size (frames per subprocess)"
                     )
-                    point_obj_id_video = gr.Number(value=0, precision=0, label="Object ID for clicks", step=1)
-                    with gr.Row():
-                        refresh_frame_btn = gr.Button("Refresh frame")
-                        clear_video_points_btn = gr.Button("Clear clicks")
-                    text_prompt_video = gr.Textbox(label="Text prompt (optional)", placeholder="e.g., person")
-                    max_frames_slider = gr.Slider(
+                    parallel_slider = gr.Slider(
+                        value=1, minimum=1, maximum=4, step=1, label="Parallel chunks (subprocesses)"
+                    )
+                    fps_override_slider = gr.Slider(
                         value=0,
                         minimum=0,
-                        maximum=500,
+                        maximum=120,
                         step=1,
-                        label="Max frames to track (0 = all; limits propagation length)",
+                        label="Output FPS (0 = keep source)",
                     )
-                    stride_slider = gr.Slider(
-                        value=1,
-                        minimum=1,
-                        maximum=60,
-                        step=1,
-                        label="Preview stride (show every Nth propagated frame in gallery/video)",
-                    )
-                    chunk_checkbox = gr.Checkbox(
-                        value=True,
-                        label="Process full video in chunks (uses max frames as chunk size)",
-                    )
-                    with gr.Row():
-                        run_prompt_btn = gr.Button("Step 1: Apply prompt (no propagation)")
-                    with gr.Row():
-                        run_prompt_and_prop_btn = gr.Button("Step 2: Apply prompt + propagate", variant="primary")
-                    gr.Markdown(
-                        "1) Apply a text prompt (optional) and click points. 2) Run **Apply prompt + propagate** once to track across the video (uses native FPS when available). "
-                        "After propagation finishes, refine with more clicks and re-run either step as needed."
-                    )
+                    process_video_btn = gr.Button("Inference + propagate (chunked subprocess)", variant="primary")
                 with gr.Column(scale=2):
-                    frame_viewer = gr.Image(label="Selected frame (click to add points)", type="pil", interactive=True)
-                    mask_viewer = gr.Image(label="Processed frame (masks)", type="pil", interactive=False)
-                    propagation_gallery = gr.Gallery(label="Propagation previews", columns=3, height=220)
-                    propagation_video = gr.Video(label="Propagation playback", interactive=False)
+                    video_preview = gr.Image(label="Preview frame", type="pil", interactive=False)
+                    masked_video = gr.Video(label="Masked video", interactive=False)
 
             video_state = gr.State()
-            video_points_state = gr.State([])
 
             video_input.change(
-                start_video_session,
+                prepare_video_upload_chunked,
                 inputs=[video_input, video_state],
-                outputs=[frame_viewer, frame_slider, video_state, video_points_state, mask_viewer, status_box],
+                outputs=[video_preview, video_state, status_box],
             )
-            frame_slider.change(
-                refresh_video_frame,
-                inputs=[frame_slider, video_state, video_points_state],
-                outputs=[frame_viewer, mask_viewer, status_box],
-            )
-            refresh_frame_btn.click(
-                refresh_video_frame,
-                inputs=[frame_slider, video_state, video_points_state],
-                outputs=[frame_viewer, mask_viewer, status_box],
-            )
-            frame_viewer.select(
-                handle_video_click,
-                inputs=[frame_viewer, point_label_video, point_obj_id_video, frame_slider, video_points_state, video_state],
-                outputs=[frame_viewer, video_points_state, status_box],
-            )
-            clear_video_points_btn.click(
-                clear_video_points,
-                inputs=[frame_slider, video_state],
-                outputs=[frame_viewer, video_points_state, mask_viewer, status_box],
-            )
-            run_prompt_btn.click(
-                run_video_prompt_only,
-                inputs=[
-                    frame_slider,
-                    text_prompt_video,
-                    max_frames_slider,
-                    stride_slider,
-                    chunk_checkbox,
-                    video_state,
-                    video_points_state,
-                ],
-                outputs=[mask_viewer, propagation_gallery, status_box, video_state, video_points_state, propagation_video],
-            )
-            run_prompt_and_prop_btn.click(
-                run_video_prompt_and_propagate,
-                inputs=[
-                    frame_slider,
-                    text_prompt_video,
-                    max_frames_slider,
-                    stride_slider,
-                    chunk_checkbox,
-                    video_state,
-                    video_points_state,
-                ],
-                outputs=[mask_viewer, propagation_gallery, status_box, video_state, video_points_state, propagation_video],
+            process_video_btn.click(
+                run_chunked_video_processing,
+                inputs=[text_prompt_video, chunk_size_slider, parallel_slider, fps_override_slider, video_state],
+                outputs=[masked_video, status_box],
             )
 
 if __name__ == "__main__":
