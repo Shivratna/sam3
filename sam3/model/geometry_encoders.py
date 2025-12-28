@@ -612,10 +612,16 @@ class SequenceGeometryEncoder(nn.Module):
             # Will take H_out = num_points, w_out = 1
             grid = points.transpose(0, 1).unsqueeze(2)
             # re normalize to [-1, 1]
+            # re normalize to [-1, 1]
             grid = (grid * 2) - 1
-            sampled = torch.nn.functional.grid_sample(
-                img_feats, grid, align_corners=False
-            )
+            if grid.device.type == "mps":
+                sampled = torch.nn.functional.grid_sample(
+                    img_feats.cpu(), grid.cpu(), align_corners=False
+                ).to(grid.device)
+            else:
+                sampled = torch.nn.functional.grid_sample(
+                    img_feats, grid, align_corners=False
+                )
             assert list(sampled.shape) == [bs, self.d_model, n_points, 1]
             sampled = sampled.squeeze(-1).permute(2, 0, 1)
             proj = self.points_pool_project(sampled)
@@ -656,11 +662,11 @@ class SequenceGeometryEncoder(nn.Module):
             # We need to denormalize, and convert to [x, y, x, y]
             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
             scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
-            scale = scale.pin_memory().to(device=boxes_xyxy.device, non_blocking=True)
+            scale = scale.to(device=boxes_xyxy.device, non_blocking=True)
             scale = scale.view(1, 1, 4)
             boxes_xyxy = boxes_xyxy * scale
             sampled = torchvision.ops.roi_align(
-                img_feats, boxes_xyxy.float().transpose(0, 1).unbind(0), self.roi_size
+                img_feats.float(), boxes_xyxy.float().transpose(0, 1).unbind(0), self.roi_size
             )
             assert list(sampled.shape) == [
                 bs * n_boxes,

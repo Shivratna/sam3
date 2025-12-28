@@ -1,5 +1,10 @@
 import glob
 import os
+
+# Set MPS fallback and disable BF16 for SAM3 on MacOS
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("SAM3_DISABLE_BF16", "1")
+
 import subprocess
 import sys
 import uuid
@@ -25,6 +30,8 @@ def _bf16_autocast_if_cuda():
     """Use bf16 autocast on CUDA when available; no-op otherwise."""
     if torch.cuda.is_available():
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    elif torch.backends.mps.is_available():
+        return torch.autocast(device_type="mps", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
 # Lazily instantiated globals (created via the "Load models" button)

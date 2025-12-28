@@ -63,7 +63,14 @@ def run_worker(frames_dir: Path, output_dir: Path, prompt_text: str, checkpoint_
             )
 
         collected = {}
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if torch.cuda.is_available():
+            autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            # MPS/CPU: run in default precision (float32) to avoid issues
+            from contextlib import nullcontext
+            autocast_context = nullcontext()
+
+        with autocast_context:
             for response in predictor.handle_stream_request(
                 {
                     "type": "propagate_in_video",

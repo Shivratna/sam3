@@ -48,9 +48,10 @@ class Sam3VideoPredictor:
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
             )
-            .cuda()
-            .eval()
         )
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.model = self.model.to(device)
+        self.model.eval()
 
     @torch.inference_mode()
     def handle_request(self, request):
@@ -266,12 +267,16 @@ class Sam3VideoPredictor:
             for session_id, session in self._ALL_INFERENCE_STATES.items()
         ]
         session_stats_str = (
-            f"live sessions: [{', '.join(live_session_strs)}], GPU memory: "
-            f"{torch.cuda.memory_allocated() // 1024**2} MiB used and "
-            f"{torch.cuda.memory_reserved() // 1024**2} MiB reserved"
-            f" (max over time: {torch.cuda.max_memory_allocated() // 1024**2} MiB used "
-            f"and {torch.cuda.max_memory_reserved() // 1024**2} MiB reserved)"
+            f"live sessions: [{', '.join(live_session_strs)}]"
         )
+        if torch.cuda.is_available():
+             session_stats_str += (
+                 f", GPU memory: "
+                 f"{torch.cuda.memory_allocated() // 1024**2} MiB used and "
+                 f"{torch.cuda.memory_reserved() // 1024**2} MiB reserved"
+                 f" (max over time: {torch.cuda.max_memory_allocated() // 1024**2} MiB used "
+                 f"and {torch.cuda.max_memory_reserved() // 1024**2} MiB reserved)"
+             )
         return session_stats_str
 
     def _get_torch_and_gpu_properties(self):
@@ -291,14 +296,20 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
     def __init__(self, *model_args, gpus_to_use=None, **model_kwargs):
         if gpus_to_use is None:
             # if not specified, use only the current GPU by default
-            gpus_to_use = [torch.cuda.current_device()]
+            if torch.cuda.is_available():
+                gpus_to_use = [torch.cuda.current_device()]
+            else:
+                 # for MPS or CPU, we treat it as a single "device 0" or similar
+                gpus_to_use = [0]
 
         IS_MAIN_PROCESS = os.getenv("IS_MAIN_PROCESS", "1") == "1"
         if IS_MAIN_PROCESS:
             gpus_to_use = sorted(set(gpus_to_use))
-            logger.info(f"using the following GPU IDs: {gpus_to_use}")
+            logger.info(f"using the following GPU/Device IDs: {gpus_to_use}")
             assert len(gpus_to_use) > 0 and all(isinstance(i, int) for i in gpus_to_use)
-            assert all(0 <= i < torch.cuda.device_count() for i in gpus_to_use)
+            if torch.cuda.is_available():
+                 assert all(0 <= i < torch.cuda.device_count() for i in gpus_to_use)
+
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = f"{self._find_free_port()}"
             os.environ["RANK"] = "0"
@@ -308,8 +319,14 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         self.rank_str = f"rank={self.rank} with world_size={self.world_size}"
-        self.device = torch.device(f"cuda:{self.gpus_to_use[self.rank]}")
-        torch.cuda.set_device(self.device)
+        
+        if torch.cuda.is_available():
+             self.device = torch.device(f"cuda:{self.gpus_to_use[self.rank]}")
+             torch.cuda.set_device(self.device)
+        elif torch.backends.mps.is_available():
+             self.device = torch.device("mps")
+        else:
+             self.device = torch.device("cpu")
         self.has_shutdown = False
         if self.rank == 0:
             logger.info("\n\n\n\t*** START loading model on all ranks ***\n\n")
@@ -421,14 +438,18 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
         # a short 3-min timeout to quickly detect any synchronization failures
         timeout_sec = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC", "180"))
         timeout = datetime.timedelta(seconds=timeout_sec)
+        timeout = datetime.timedelta(seconds=timeout_sec)
+        
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        
         torch.distributed.init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method="env://",
             timeout=timeout,
-            device_id=self.device,
+            device_id=self.device if torch.cuda.is_available() else None,
         )
         # warm-up the NCCL process group by running a dummy all-reduce
-        tensor = torch.ones(1024, 1024).cuda()
+        tensor = torch.ones(1024, 1024).to(self.device)
         torch.distributed.all_reduce(tensor)
         logger.debug(f"started NCCL process group on {rank=} with {world_size=}")
 
