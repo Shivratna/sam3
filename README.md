@@ -147,6 +147,17 @@ response = video_predictor.handle_request(
 output = response["outputs"]
 ```
 
+### Batch Inference
+
+To run batch segmentation on a folder of images using `batch_inference.py`:
+
+```bash
+python3 -m uv run python batch_inference.py --input_dir /path/to/images --output_dir /path/to/results --prompt "your prompt" --save_crops
+```
+
+**Note:** On macOS with MPS, the script handles `aten::_assert_async` fallback automatically.
+
+
 ## Examples
 
 The `examples` directory contains notebooks demonstrating how to use SAM3 with
